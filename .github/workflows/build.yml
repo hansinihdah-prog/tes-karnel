@@ -228,7 +228,7 @@ jobs:
               f.write(content)
 
           remaining = [sym for sym in [
-              "ksu_lsm_hook_init", "ksu_late_loaded",
+              "ksu_lsm_hook_init",
               "ksu_syscall_hook_manager_init", "ksu_syscall_hook_manager_exit",
               "ksu_init_symbol_resolver", "ksu_syscall_hook_init(",
           ] if sym in content]
