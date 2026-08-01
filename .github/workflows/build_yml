@@ -1,0 +1,278 @@
+on:
+  workflow_dispatch:
+    inputs:
+      root_provider:
+        description: "Solución de root"
+        type: choice
+        options:
+          - ksu-next-stable
+          - ksu-next-susfs
+          - sukisu-ultra-v4.1.3
+        default: ksu-next-stable
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Liberar espacio en el runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          sudo rm -rf /usr/local/lib/android/sdk/system-images \
+                      /usr/local/lib/android/sdk/emulator
+          sudo apt-get clean
+          df -h
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+            libncurses-dev python3 python3-pip zip unzip rsync kmod cpio \
+            device-tree-compiler default-jdk git curl patch
+
+      - name: Descargar toolchain (con reintentos)
+        run: |
+          pip install gdown
+          for i in 1 2 3; do
+            gdown "https://drive.google.com/uc?id=1um0sIcncTeqVkAE28DwKHlPv1427T5Nb" -O toolchain.tar.gz && break
+            echo "Intento $i falló, reintentando en 10s..."
+            sleep 10
+          done
+          test -s toolchain.tar.gz || { echo "❌ No se pudo descargar el toolchain"; exit 1; }
+          tar -xf toolchain.tar.gz
+
+      - name: Neutralizar setup.sh original en build_kernel.sh
+        run: |
+          sed -i '/tiann\/KernelSU\/main\/kernel\/setup.sh/d' build_kernel.sh
+
+      - name: Integrar KernelSU-Next
+        if: ${{ inputs.root_provider == 'ksu-next-stable' }}
+        working-directory: ./kernel-6.6
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s v3.3.0
+          test -d KernelSU-Next || { echo "❌ Falló la integración de KernelSU-Next"; exit 1; }
+          echo "KSUN_COMMIT=$(cd KernelSU-Next && git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # KernelSU-Next + SUSFS: usamos el fork pershoot/KernelSU-Next en su
+      # rama next-susfs, que YA trae los hooks de SUSFS integrados en el
+      # driver (a diferencia de SukiSU-Ultra, acá no hace falta parchear
+      # init.c/Kbuild a mano). Aviso del propio mantenedor: no está
+      # garantizado como listo para producción.
+      # ------------------------------------------------------------------
+      - name: Integrar KernelSU-Next (SUSFS)
+        if: ${{ inputs.root_provider == 'ksu-next-susfs' }}
+        working-directory: ./kernel-6.6
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          test -d KernelSU-Next || { echo "❌ Falló la integración de KernelSU-Next (SUSFS)"; exit 1; }
+          echo "KSUN_COMMIT=$(cd KernelSU-Next && git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          echo "🔎 Diagnóstico: ¿el driver de este fork ya trae susfs_init() de fábrica?"
+          grep -rn "susfs_init" KernelSU-Next/kernel/core/init.c 2>/dev/null \
+            || echo "   ⚠️ No se encontró susfs_init() en init.c — puede que la ruta interna sea distinta a la que asumí, revisar a mano si el parche 50 falla más adelante"
+
+      - name: Integrar SukiSU-Ultra (builtin, fijado a la fecha del release v4.1.3 del Manager)
+        if: ${{ inputs.root_provider == 'sukisu-ultra-v4.1.3' }}
+        working-directory: ./kernel-6.6
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+
+          echo "🔒 Fijando la rama 'builtin' al commit que existía cuando se publicó el Manager v4.1.3 (2026-06-02 07:33 UTC),"
+          echo "   para que la versión del driver del kernel coincida con la versión del Manager APK instalado."
+          cd KernelSU
+          PINNED_COMMIT=$(git rev-list -n1 --before="2026-06-02 07:33:00" origin/builtin)
+          test -n "$PINNED_COMMIT" || { echo "❌ No se pudo resolver un commit de 'builtin' anterior a esa fecha"; exit 1; }
+          git checkout "$PINNED_COMMIT"
+          echo "✅ builtin fijado al commit $PINNED_COMMIT (mismo punto en el tiempo que el release v4.1.3 del Manager)"
+          cd ..
+          echo "SUKISU_COMMIT=$(cd KernelSU && git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          echo "🔎 Verificando que SUSFS ya viene integrado en el driver builtin (no debería hacer falta parchear nada más)..."
+          grep -rq "susfs" KernelSU/kernel/Kconfig 2>/dev/null \
+            && echo "✅ El driver builtin ya trae las opciones de SUSFS" \
+            || echo "⚠️ No se encontró 'susfs' en Kconfig del driver — revisar manualmente"
+
+      - name: Integrar cabecera y parches de árbol de SUSFS (SukiSU-Ultra builtin)
+        if: ${{ inputs.root_provider == 'sukisu-ultra-v4.1.3' }}
+        working-directory: ./kernel-6.6
+        run: |
+          echo "📥 'builtin' ya trae los hooks del driver listos, pero linux/susfs.h y los cambios en fs/"
+          echo "   todavía deben venir de susfs4ksu — sin esto, drivers/kernelsu/kernel_includes.h no compila."
+          git clone -b gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+
+          echo "📂 Copiando include/linux/susfs.h y los cambios de fs/ al árbol del kernel..."
+          cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+
+          echo "🔧 Registrando susfs.o / sus_su.o en fs/Makefile (si no, quedan copiados pero nunca compilados/enlazados)..."
+          grep -q "CONFIG_KSU_SUSFS) += susfs.o" fs/Makefile || \
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+          grep -q "CONFIG_KSU_SUSFS_SUS_SU) += sus_su.o" fs/Makefile || \
+            echo 'obj-$(CONFIG_KSU_SUSFS_SUS_SU) += sus_su.o' >> fs/Makefile
+          echo "✅ fs/Makefile actualizado:"
+          tail -5 fs/Makefile
+
+          echo "✅ Cabecera susfs.h copiada. No se toca core_hook.c/init.c: 'builtin' ya los trae integrados."
+
+      # ------------------------------------------------------------------
+      # KernelSU-Next + SUSFS: SOLO el parche del árbol del kernel
+      # (fs/, include/linux/, 50_add_susfs_in_gki-android15-6.6.patch).
+      # A propósito NO copiamos la auto-reparación de arriba: esa lógica
+      # asume nombres de función específicos de SukiSU-Ultra que muy
+      # probablemente no existen en el driver de KernelSU-Next. Si el
+      # parche 50 falla acá, el error de patch/*.rej nos va a decir
+      # exactamente qué archivo y qué hunk, y ahí armamos el fix
+      # específico para KSU-Next en vez de adivinar.
+      # ------------------------------------------------------------------
+      - name: Integrar parches SUSFS al código del Kernel (KernelSU-Next)
+        if: ${{ inputs.root_provider == 'ksu-next-susfs' }}
+        working-directory: ./kernel-6.6
+        run: |
+          echo "📥 Clonando repositorio de SUSFS (fork pershoot, sincronizado con su core_hook.c) y fijando al commit verificado..."
+          git clone -b gki-android15-6.6 https://github.com/WildKernels/susfs4ksu.git ../susfs4ksu
+          (cd ../susfs4ksu && git checkout 2df41de789026a6422521606402576507c687435)
+
+          echo "📂 Copiando archivos base de SUSFS al kernel..."
+          cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+
+          PATCH_DIR="../susfs4ksu/kernel_patches"
+          PATCH_50=$(ls $PATCH_DIR/50_add_susfs_in_*.patch | head -n 1)
+          test -n "$PATCH_50" || { echo "❌ No se encontró parche 50_add_susfs_in_*.patch"; exit 1; }
+
+          echo "🩹 Aplicando parche 50 sobre el árbol del kernel (fs/, hooks core)..."
+          if ! patch -p1 --forward --fuzz=3 < "$PATCH_50"; then
+            echo "❌ El parche 50 no aplicó limpio contra este árbol (probable drift vs. tu fork MediaTek/Samsung)."
+            echo "   *.rej generados (revisar a mano, uno por uno):"
+            find . -name '*.rej' -exec echo "--- {} ---" \; -exec cat {} \;
+            exit 1
+          fi
+
+          if ls $PATCH_DIR/51_susfs_add_hook_in_*.patch 1> /dev/null 2>&1; then
+            patch -p1 --forward --fuzz=3 < $(ls $PATCH_DIR/51_susfs_add_hook_in_*.patch | head -n 1) || {
+              echo "❌ Falló el parche 51 — revisar *.rej:"
+              find . -name '*.rej' -exec echo "--- {} ---" \; -exec cat {} \;
+              exit 1
+            }
+          else
+            echo "ℹ️ Parche 51 no encontrado, los hooks probablemente estén unificados en el parche 50."
+          fi
+
+          grep -q "susfs" fs/Makefile || { echo "❌ El parche 50 no modificó fs/Makefile como se esperaba"; exit 1; }
+
+          echo "🔎 ¿drivers/kernelsu (symlink a KernelSU-Next/kernel) sigue reflejando el driver con soporte SUSFS?"
+          ls -la drivers/kernelsu 2>/dev/null || echo "⚠️ drivers/kernelsu no existe o no es lo esperado, revisar"
+          grep -rq "susfs" drivers/kernelsu/Kconfig 2>/dev/null \
+            && echo "✅ drivers/kernelsu/Kconfig menciona susfs — el fork trae las opciones esperadas" \
+            || echo "⚠️ drivers/kernelsu/Kconfig no menciona susfs — revisar si el fork pershoot/KernelSU-Next realmente trae el Kconfig actualizado en esta rama"
+
+      - name: Fijar restricciones del compilador Clang
+        working-directory: ./kernel-6.6
+        run: |
+          echo "🛠️ Inyectando pragma para ignorar errores estrictos de array-bounds en signal.h..."
+          sed -i '1i #pragma GCC diagnostic ignored "-Warray-bounds"' include/linux/signal.h
+
+          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ]; then
+            SELINUX_HIDE_C="KernelSU/kernel/feature/selinux_hide.c"
+            if [ -f "$SELINUX_HIDE_C" ]; then
+              echo "🛠️ Inyectando pragma para ignorar -Wpointer-bool-conversion en selinux_hide.c"
+              echo "   (el código chequea 'if (nombre_de_funcion)' en vez de un puntero a función,"
+              echo "    lo que Clang moderno marca como error con -Werror; no es algo que debamos"
+              echo "    reescribir a mano en código de SukiSU-Ultra que no es nuestro)"
+              sed -i '1i #pragma GCC diagnostic ignored "-Wpointer-bool-conversion"' "$SELINUX_HIDE_C"
+            else
+              echo "⚠️ No se encontró $SELINUX_HIDE_C, si aparece este error de nuevo revisar la ruta"
+            fi
+          fi
+
+      - name: Habilitar CONFIG_KSU y SUSFS en overlay
+        run: |
+          CFG=$(grep -rl "CONFIG_KSU" --include="*.config" . 2>/dev/null | head -n1)
+          if [ -z "$CFG" ]; then
+            CFG="./kernel/kernel_device_modules-6.6/kernel/configs/mt6768_overlay.config"
+            echo "⚠️ No se encontró config existente, usando default: $CFG"
+          fi
+          echo "Usando config: $CFG"
+          
+          if ! grep -q "CONFIG_KSU=y" "$CFG"; then
+            echo "CONFIG_KSU=y" >> "$CFG"
+          fi
+          
+          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ] || [ "${{ inputs.root_provider }}" == "ksu-next-susfs" ]; then
+            echo "Inyectando flags completas de SUSFS..."
+            sed -i '/CONFIG_KSU_SUSFS/d' "$CFG"
+            cat <<EOF >> "$CFG"
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+
+      - name: Verificar que el parche de drivers/kernelsu sobrevivió hasta este punto
+        working-directory: ./kernel-6.6
+        run: |
+          echo "🔎 Justo antes de compilar — ¿drivers/kernelsu todavía tiene susfs_init()?"
+          ls -la drivers/kernelsu
+          grep -q "susfs_init()" drivers/kernelsu/core/init.c \
+            && echo "✅ Sigue parcheado justo antes de 'Compilar' — si se rompe, es Bazel/make durante la compilación, no un paso previo de CI" \
+            || echo "❌ YA se perdió antes de compilar — algo entre el parcheo y este punto (cache de Bazel restaurada, etc.) lo revirtió"
+
+      - name: Cache de Bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: bazel-cache-${{ runner.os }}-${{ inputs.root_provider }}-${{ hashFiles('kernel/WORKSPACE') }}
+
+      - name: Compilar
+        run: |
+          echo "📄 Contenido completo de build_kernel.sh (para ver si resetea submódulos/git antes de invocar bazel/make):"
+          cat -n build_kernel.sh
+          echo "───────────────────────────────────────────"
+          chmod +x build_kernel.sh
+          bash build_kernel.sh
+
+      - name: Diagnóstico post-mortem de drivers/kernelsu (corre siempre, incluso si falló Compilar)
+        if: always()
+        working-directory: ./kernel-6.6
+        run: |
+          echo "🔎 Estado de drivers/kernelsu DESPUÉS del intento de compilación:"
+          ls -la drivers/kernelsu 2>/dev/null || echo "   No existe / no se puede acceder"
+          if [ -L drivers/kernelsu ]; then
+            echo "   Es un symlink, apunta a: $(readlink drivers/kernelsu)"
+          elif [ -d drivers/kernelsu ]; then
+            echo "   Es un directorio real (no symlink)"
+          fi
+          echo "🔎 ¿Todavía tiene susfs_init()?"
+          grep -q "susfs_init()" drivers/kernelsu/core/init.c 2>/dev/null \
+            && echo "   ✅ Sigue con susfs_init() — el error de compilación no fue por reversión de este archivo" \
+            || echo "   ❌ Ya NO tiene susfs_init() — algo lo reescribió/reapuntó durante la compilación"
+
+      - name: Subir artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a05m-kernel-${{ inputs.root_provider }}-${{ github.run_number }}
+          path: "*.zip"
+          retention-days: 14
