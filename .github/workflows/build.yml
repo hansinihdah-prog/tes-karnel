@@ -106,23 +106,23 @@ jobs:
         if: ${{ inputs.root_provider == 'sukisu-ultra-v4.1.3' }}
         working-directory: ./kernel-6.6
         run: |
-          echo "📥 'builtin' ya trae los hooks del driver listos, pero linux/susfs.h y los cambios en fs/"
-          echo "   todavía deben venir de susfs4ksu — sin esto, drivers/kernelsu/kernel_includes.h no compila."
+          echo "📥 'builtin' ya trae los hooks del driver listos, pero el árbol base del kernel (fs/, security/selinux/,"
+          echo "   include/linux/) todavía necesita el parche unificado de susfs4ksu para compilar y enlazar bien."
           git clone -b gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          (cd ../susfs4ksu && git checkout 2df41de789026a6422521606402576507c687435)
 
-          echo "📂 Copiando include/linux/susfs.h y los cambios de fs/ al árbol del kernel..."
+          echo "📂 Copiando cabeceras base de SUSFS..."
           cp -r ../susfs4ksu/kernel_patches/fs/* ./fs/
           cp -r ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
 
-          echo "🔧 Registrando susfs.o / sus_su.o en fs/Makefile (si no, quedan copiados pero nunca compilados/enlazados)..."
-          grep -q "CONFIG_KSU_SUSFS) += susfs.o" fs/Makefile || \
-            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
-          grep -q "CONFIG_KSU_SUSFS_SUS_SU) += sus_su.o" fs/Makefile || \
-            echo 'obj-$(CONFIG_KSU_SUSFS_SUS_SU) += sus_su.o' >> fs/Makefile
-          echo "✅ fs/Makefile actualizado:"
-          tail -5 fs/Makefile
+          echo "🩹 Aplicando el parche unificado 50_add_susfs_in_gki-android15-6.6.patch"
+          echo "   (esto registra fs/Makefile, exporta símbolos de security/selinux/, etc. — todo lo que"
+          echo "   el copiado manual se queda corto en integrar)"
+          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch .
+          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android15-6.6.patch || \
+            echo "⚠️ Algunos hunks no aplicaron limpio (probable drift del árbol vs upstream GKI) — revisar salida arriba"
 
-          echo "✅ Cabecera susfs.h copiada. No se toca core_hook.c/init.c: 'builtin' ya los trae integrados."
+          echo "✅ Árbol del kernel parcheado con SUSFS. No se toca core_hook.c/init.c de KernelSU: 'builtin' ya los trae integrados."
 
       # ------------------------------------------------------------------
       # KernelSU-Next + SUSFS: SOLO el parche del árbol del kernel
