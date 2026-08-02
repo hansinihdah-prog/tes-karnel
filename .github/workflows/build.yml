@@ -55,6 +55,20 @@ jobs:
         run: |
           sed -i '/tiann\/KernelSU\/main\/kernel\/setup.sh/d' build_kernel.sh
 
+          if [ "${{ inputs.root_provider }}" != "ksu-next-stable" ] && [ "${{ inputs.root_provider }}" != "ksu-next-susfs" ]; then
+            echo "🛠️ root_provider=${{ inputs.root_provider }}: neutralizando también la llamada a"
+            echo "   rsuntk/KernelSU/setup.sh dentro de build_kernel.sh (la línea que hace 'curl ... | bash -s \"\$KSUN_COMMIT\"')."
+            echo "   Motivo: como KSUN_COMMIT no está seteado para este provider, esa llamada termina hacienda"
+            echo "   'git stash' + 'git checkout <último tag>' sobre la carpeta KernelSU/ que ya integramos a mano —"
+            echo "   eso descarta cualquier fix aplicado (ej. el fix de KSU_VERSION) y puede dejar un commit distinto"
+            echo "   al que fijamos en el paso de integración. Confirmado como causa real de un build roto de ReSukiSU."
+            grep -n "rsuntk/KernelSU" build_kernel.sh || echo "⚠️ No se encontró la línea esperada — revisar build_kernel.sh a mano"
+            sed -i '/rsuntk\/KernelSU\/main\/kernel\/setup.sh/d' build_kernel.sh
+          fi
+
+          echo "📄 build_kernel.sh tras neutralizar (debe ya NO tener ninguna llamada a setup.sh de KernelSU/KernelSU-Next):"
+          cat -n build_kernel.sh
+
       - name: Integrar KernelSU-Next
         if: ${{ inputs.root_provider == 'ksu-next-stable' }}
         working-directory: ./kernel-6.6
@@ -149,34 +163,37 @@ jobs:
       # RESUKISU_COMMIT), y lo dejamos fijo en el Makefile para que no
       # dependa de git en tiempo de compilación.
       # ------------------------------------------------------------------
-      - name: Fix cálculo roto de KERNEL_SU_VERSION en el Makefile de ReSukiSU
+      - name: Fix cálculo roto de KSU_VERSION en KernelSU/kernel/Kbuild (ReSukiSU)
         if: ${{ inputs.root_provider == 'resukisu' }}
         working-directory: ./kernel-6.6
         run: |
-          echo "🔎 Buscando dónde se define KSU_VERSION / KERNEL_SU_VERSION en TODO KernelSU/ (Makefiles, Kbuild, headers)..."
-          echo "   (ksu.h solo hace '#define KERNEL_SU_VERSION KSU_VERSION' — el cálculo real con git vive en otro lado,"
-          echo "    probablemente un Makefile/Kbuild que inyecta -DKSU_VERSION=... vía ccflags)"
-          MATCHES=$(grep -rlnE "KSU_VERSION|KERNEL_SU_VERSION" KernelSU/ 2>/dev/null || true)
-          if [ -z "$MATCHES" ]; then
-            echo "❌ No se encontró ninguna coincidencia en todo KernelSU/"
-            echo "⚠️ Continuando sin aplicar el fix — revisar la salida de este paso en el log si vuelve a fallar"
-          else
-            echo "✅ Encontrado en:"
-            echo "$MATCHES"
-            SAFE_VERSION=$(cd KernelSU && git rev-list --count HEAD)
-            test -n "$SAFE_VERSION" || { echo "❌ No se pudo calcular un número de versión desde git"; exit 1; }
-            echo "🔢 Número de versión calculado en CI (git funciona bien acá): $SAFE_VERSION"
+          KBUILD_FILE="KernelSU/kernel/Kbuild"
+          echo "🔎 Estructura conocida (de un intento de build anterior):"
+          echo "   KSU_LOCAL_VERSION := \$(shell cd \$(KSU_SRC); \$(GIT_BIN) rev-list --count HEAD)"
+          echo "   KSU_VERSION := \$(shell expr 30000 + \$(KSU_LOCAL_VERSION) + 700)"
+          echo "   La primera línea falla en este runner (probable: git/.git no visible dentro del sandbox"
+          echo "   de Bazel al momento de compilar), dejando KSU_LOCAL_VERSION vacío y KSU_VERSION roto."
+          test -f "$KBUILD_FILE" || { echo "❌ No se encontró $KBUILD_FILE, la estructura del repo pudo haber cambiado"; exit 1; }
 
-            echo "$MATCHES" | while IFS= read -r FILE; do
-              [ -z "$FILE" ] && continue
-              echo "🔎 Contexto en $FILE ANTES del fix:"
-              grep -n -B2 -A2 -E "KSU_VERSION|KERNEL_SU_VERSION" "$FILE"
-              echo "🛠️ Reemplazando cualquier \$(shell ... ) en líneas que mencionan KSU_VERSION/KERNEL_SU_VERSION por el número fijo en $FILE..."
-              sed -i -E "/KSU_VERSION|KERNEL_SU_VERSION/ s/\\\$\\(shell[^)]*\\)/${SAFE_VERSION}/g" "$FILE"
-              echo "🔎 Contexto en $FILE DESPUÉS del fix:"
-              grep -n -B2 -A2 -E "KSU_VERSION|KERNEL_SU_VERSION" "$FILE"
-            done
+          echo "🔎 Contexto ANTES del fix:"
+          grep -n -B1 -A1 "KSU_LOCAL_VERSION\|^KSU_VERSION :=" "$KBUILD_FILE" || true
+
+          SAFE_VERSION=$(cd KernelSU && git rev-list --count HEAD)
+          test -n "$SAFE_VERSION" || { echo "❌ No se pudo calcular un número de versión desde git"; exit 1; }
+          echo "🔢 Número calculado en CI (acá git sí funciona): $SAFE_VERSION"
+
+          echo "🛠️ Fijando SOLO KSU_LOCAL_VERSION como número literal — dejamos KSU_VERSION intacta,"
+          echo "   así su 'expr 30000 + \$(KSU_LOCAL_VERSION) + 700' sigue funcionando con un número plano,"
+          echo "   sin depender de git para nada en tiempo de compilación."
+          if grep -qE '^KSU_LOCAL_VERSION := \$\(shell.*\)$' "$KBUILD_FILE"; then
+            sed -i -E "s|^KSU_LOCAL_VERSION := \\\$\\(shell.*\\)\$|KSU_LOCAL_VERSION := ${SAFE_VERSION}|" "$KBUILD_FILE"
+            echo "✅ Línea de KSU_LOCAL_VERSION reemplazada por un número literal."
+          else
+            echo "⚠️ La línea de KSU_LOCAL_VERSION no coincide con el patrón esperado — revisar salida de arriba a mano"
           fi
+
+          echo "🔎 Contexto DESPUÉS del fix:"
+          grep -n -B1 -A1 "KSU_LOCAL_VERSION\|^KSU_VERSION :=" "$KBUILD_FILE" || true
 
       - name: Integrar cabecera y parches de árbol de SUSFS (ReSukiSU)
         if: ${{ inputs.root_provider == 'resukisu' }}
