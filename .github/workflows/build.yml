@@ -8,6 +8,7 @@ on:
           - ksu-next-stable
           - ksu-next-susfs
           - sukisu-ultra-v4.1.3
+          - resukisu
         default: ksu-next-stable
 
 concurrency:
@@ -124,6 +125,39 @@ jobs:
 
           echo "✅ Árbol del kernel parcheado con SUSFS. No se toca core_hook.c/init.c de KernelSU: 'builtin' ya los trae integrados."
 
+      - name: Integrar ReSukiSU (fork de SukiSU-Ultra orientado a estabilidad)
+        if: ${{ inputs.root_provider == 'resukisu' }}
+        working-directory: ./kernel-6.6
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
+          test -d KernelSU || { echo "❌ Falló la integración de ReSukiSU (no se encontró la carpeta KernelSU)"; exit 1; }
+          echo "RESUKISU_COMMIT=$(cd KernelSU && git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          echo "🔎 ¿El driver de ReSukiSU ya trae las opciones de SUSFS en su Kconfig?"
+          grep -rq "susfs" KernelSU/kernel/Kconfig 2>/dev/null \
+            && echo "✅ El driver de ReSukiSU ya trae las opciones de SUSFS" \
+            || echo "⚠️ No se encontró 'susfs' en Kconfig del driver de ReSukiSU — puede hacer falta el mismo fix manual de Kconfig que se usó para SukiSU-Ultra rama 'main'"
+
+      - name: Integrar cabecera y parches de árbol de SUSFS (ReSukiSU)
+        if: ${{ inputs.root_provider == 'resukisu' }}
+        working-directory: ./kernel-6.6
+        run: |
+          echo "📥 Igual que con SukiSU-Ultra builtin: el árbol base del kernel (fs/, include/linux/) todavía"
+          echo "   necesita el parche unificado de susfs4ksu para compilar y enlazar bien."
+          git clone -b gki-android15-6.6 https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu-resukisu
+          (cd ../susfs4ksu-resukisu && git checkout 2df41de789026a6422521606402576507c687435)
+
+          echo "📂 Copiando cabeceras base de SUSFS..."
+          cp -r ../susfs4ksu-resukisu/kernel_patches/fs/* ./fs/
+          cp -r ../susfs4ksu-resukisu/kernel_patches/include/linux/* ./include/linux/
+
+          echo "🩹 Aplicando el parche unificado 50_add_susfs_in_gki-android15-6.6.patch"
+          cp ../susfs4ksu-resukisu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch .
+          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android15-6.6.patch || \
+            echo "⚠️ Algunos hunks no aplicaron limpio (probable drift del árbol vs upstream GKI) — revisar salida arriba"
+
+          echo "✅ Árbol del kernel parcheado con SUSFS para ReSukiSU."
+
       # ------------------------------------------------------------------
       # KernelSU-Next + SUSFS: SOLO el parche del árbol del kernel
       # (fs/, include/linux/, 50_add_susfs_in_gki-android15-6.6.patch).
@@ -182,7 +216,7 @@ jobs:
           echo "🛠️ Inyectando pragma para ignorar errores estrictos de array-bounds en signal.h..."
           sed -i '1i #pragma GCC diagnostic ignored "-Warray-bounds"' include/linux/signal.h
 
-          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ]; then
+          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ] || [ "${{ inputs.root_provider }}" == "resukisu" ]; then
             SELINUX_HIDE_C="KernelSU/kernel/feature/selinux_hide.c"
             if [ -f "$SELINUX_HIDE_C" ]; then
               echo "🛠️ Inyectando pragma para ignorar -Wpointer-bool-conversion en selinux_hide.c"
@@ -208,7 +242,7 @@ jobs:
             echo "CONFIG_KSU=y" >> "$CFG"
           fi
           
-          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ] || [ "${{ inputs.root_provider }}" == "ksu-next-susfs" ]; then
+          if [ "${{ inputs.root_provider }}" == "sukisu-ultra-v4.1.3" ] || [ "${{ inputs.root_provider }}" == "ksu-next-susfs" ] || [ "${{ inputs.root_provider }}" == "resukisu" ]; then
             echo "Inyectando flags completas de SUSFS..."
             sed -i '/CONFIG_KSU_SUSFS/d' "$CFG"
             cat <<EOF >> "$CFG"
