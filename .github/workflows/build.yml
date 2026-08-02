@@ -138,6 +138,37 @@ jobs:
             && echo "✅ El driver de ReSukiSU ya trae las opciones de SUSFS" \
             || echo "⚠️ No se encontró 'susfs' en Kconfig del driver de ReSukiSU — puede hacer falta el mismo fix manual de Kconfig que se usó para SukiSU-Ultra rama 'main'"
 
+      # ------------------------------------------------------------------
+      # Bug detectado en el primer intento de build: KernelSU/kernel/Makefile
+      # calcula KERNEL_SU_VERSION invocando "git" dentro del propio proceso
+      # de compilación (make/bazel), y en este runner esa invocación falla
+      # ("fatal: ambiguous argument 'miuix'..." / "expr: non-integer
+      # argument"), dejando la macro vacía → error de sintaxis C en
+      # supercalls.c ("expected expression"). Calculamos el número acá,
+      # en el paso de CI (donde git SÍ funciona, ya lo probamos arriba con
+      # RESUKISU_COMMIT), y lo dejamos fijo en el Makefile para que no
+      # dependa de git en tiempo de compilación.
+      # ------------------------------------------------------------------
+      - name: Fix cálculo roto de KERNEL_SU_VERSION en el Makefile de ReSukiSU
+        if: ${{ inputs.root_provider == 'resukisu' }}
+        working-directory: ./kernel-6.6
+        run: |
+          MK="KernelSU/kernel/Makefile"
+          test -f "$MK" || { echo "❌ No se encontró $MK, revisar estructura del repo ReSukiSU"; exit 1; }
+
+          echo "🔎 Líneas relacionadas a KERNEL_SU_VERSION en $MK (antes del fix):"
+          grep -n "KERNEL_SU_VERSION\|KSU_VERSION\|KSU_GIT_VERSION" "$MK" || echo "   (no se encontraron coincidencias con esos nombres — puede que el nombre real sea otro)"
+
+          SAFE_VERSION=$(cd KernelSU && git rev-list --count HEAD)
+          test -n "$SAFE_VERSION" || { echo "❌ No se pudo calcular un número de versión desde git"; exit 1; }
+          echo "🔢 Número de versión calculado en CI (git funciona bien acá): $SAFE_VERSION"
+
+          echo "🛠️ Reemplazando cualquier \$(shell ... ) en líneas que mencionan KERNEL_SU_VERSION/KSU_VERSION/KSU_GIT_VERSION por el número fijo..."
+          sed -i -E "/KERNEL_SU_VERSION|KSU_VERSION|KSU_GIT_VERSION/ s/\\\$\\(shell[^)]*\\)/${SAFE_VERSION}/g" "$MK"
+
+          echo "🔎 Líneas después del fix:"
+          grep -n "KERNEL_SU_VERSION\|KSU_VERSION\|KSU_GIT_VERSION" "$MK" || true
+
       - name: Integrar cabecera y parches de árbol de SUSFS (ReSukiSU)
         if: ${{ inputs.root_provider == 'resukisu' }}
         working-directory: ./kernel-6.6
