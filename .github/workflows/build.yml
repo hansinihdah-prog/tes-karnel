@@ -153,21 +153,30 @@ jobs:
         if: ${{ inputs.root_provider == 'resukisu' }}
         working-directory: ./kernel-6.6
         run: |
-          MK="KernelSU/kernel/Makefile"
-          test -f "$MK" || { echo "❌ No se encontró $MK, revisar estructura del repo ReSukiSU"; exit 1; }
+          echo "🔎 Buscando dónde se define KSU_VERSION / KERNEL_SU_VERSION en TODO KernelSU/ (Makefiles, Kbuild, headers)..."
+          echo "   (ksu.h solo hace '#define KERNEL_SU_VERSION KSU_VERSION' — el cálculo real con git vive en otro lado,"
+          echo "    probablemente un Makefile/Kbuild que inyecta -DKSU_VERSION=... vía ccflags)"
+          MATCHES=$(grep -rlnE "KSU_VERSION|KERNEL_SU_VERSION" KernelSU/ 2>/dev/null || true)
+          if [ -z "$MATCHES" ]; then
+            echo "❌ No se encontró ninguna coincidencia en todo KernelSU/"
+            echo "⚠️ Continuando sin aplicar el fix — revisar la salida de este paso en el log si vuelve a fallar"
+          else
+            echo "✅ Encontrado en:"
+            echo "$MATCHES"
+            SAFE_VERSION=$(cd KernelSU && git rev-list --count HEAD)
+            test -n "$SAFE_VERSION" || { echo "❌ No se pudo calcular un número de versión desde git"; exit 1; }
+            echo "🔢 Número de versión calculado en CI (git funciona bien acá): $SAFE_VERSION"
 
-          echo "🔎 Líneas relacionadas a KERNEL_SU_VERSION en $MK (antes del fix):"
-          grep -n "KERNEL_SU_VERSION\|KSU_VERSION\|KSU_GIT_VERSION" "$MK" || echo "   (no se encontraron coincidencias con esos nombres — puede que el nombre real sea otro)"
-
-          SAFE_VERSION=$(cd KernelSU && git rev-list --count HEAD)
-          test -n "$SAFE_VERSION" || { echo "❌ No se pudo calcular un número de versión desde git"; exit 1; }
-          echo "🔢 Número de versión calculado en CI (git funciona bien acá): $SAFE_VERSION"
-
-          echo "🛠️ Reemplazando cualquier \$(shell ... ) en líneas que mencionan KERNEL_SU_VERSION/KSU_VERSION/KSU_GIT_VERSION por el número fijo..."
-          sed -i -E "/KERNEL_SU_VERSION|KSU_VERSION|KSU_GIT_VERSION/ s/\\\$\\(shell[^)]*\\)/${SAFE_VERSION}/g" "$MK"
-
-          echo "🔎 Líneas después del fix:"
-          grep -n "KERNEL_SU_VERSION\|KSU_VERSION\|KSU_GIT_VERSION" "$MK" || true
+            echo "$MATCHES" | while IFS= read -r FILE; do
+              [ -z "$FILE" ] && continue
+              echo "🔎 Contexto en $FILE ANTES del fix:"
+              grep -n -B2 -A2 -E "KSU_VERSION|KERNEL_SU_VERSION" "$FILE"
+              echo "🛠️ Reemplazando cualquier \$(shell ... ) en líneas que mencionan KSU_VERSION/KERNEL_SU_VERSION por el número fijo en $FILE..."
+              sed -i -E "/KSU_VERSION|KERNEL_SU_VERSION/ s/\\\$\\(shell[^)]*\\)/${SAFE_VERSION}/g" "$FILE"
+              echo "🔎 Contexto en $FILE DESPUÉS del fix:"
+              grep -n -B2 -A2 -E "KSU_VERSION|KERNEL_SU_VERSION" "$FILE"
+            done
+          fi
 
       - name: Integrar cabecera y parches de árbol de SUSFS (ReSukiSU)
         if: ${{ inputs.root_provider == 'resukisu' }}
